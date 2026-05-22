@@ -69,6 +69,37 @@ class TaskProgress:
             return False
 
 
+@dataclass(slots=True)
+class MissionRewardInfo:
+    task_id: str
+    task_name: str
+    status: int
+    message: str
+    act_id: str
+    act_name: str
+    reward_name: str
+
+    @property
+    def is_claimable(self) -> bool:
+        return self.status == 0
+
+    @property
+    def is_claimed(self) -> bool:
+        return self.status == 6
+
+
+@dataclass(slots=True)
+class MissionRewardClaimResult:
+    task_id: str
+    task_name: str
+    reward_name: str
+    status: int
+    message: str
+    success: bool
+    skipped: bool
+    code: int | str | None = None
+
+
 class BilibiliClient:
     MIXIN_KEY_ENC_TAB = [
         46,
@@ -261,6 +292,23 @@ class BilibiliClient:
             "Cookie": self.cookie_header,
         }
 
+    def _mission_headers(self, task_id: str) -> dict[str, str]:
+        return {
+            "Referer": (
+                "https://www.bilibili.com/blackboard/era/award-exchange.html"
+                f"?task_id={urllib.parse.quote(task_id, safe='')}"
+            ),
+            "Origin": "https://www.bilibili.com",
+            "User-Agent": self.user_agent,
+            "Cookie": self.cookie_header,
+        }
+
+    @staticmethod
+    def _is_rate_limited_payload(payload: dict[str, Any]) -> bool:
+        code = str(payload.get("code") or "")
+        message = str(payload.get("message") or "")
+        return code in {"-702", "-509"} or "频率" in message or "频繁" in message
+
     async def _request_with_transient_retry(
         self,
         request_coro,
@@ -376,6 +424,37 @@ class BilibiliClient:
                     params=signed_params,
                     headers=headers,
                     follow_redirects=follow_redirects,
+                ),
+                method="POST",
+                url=url,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("code") == 0:
+                return payload
+            if retry == 0 and retry_on_wbi_miss:
+                self._wbi_cache = None
+        return payload
+
+    async def _signed_post_form_json(
+        self,
+        url: str,
+        params: dict[str, Any],
+        body: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+        retry_on_wbi_miss: bool = True,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        retries = 2 if retry_on_wbi_miss else 1
+        for retry in range(retries):
+            signed_params = await self.sign_wbi(params)
+            response = await self._request_with_transient_retry(
+                lambda: self._http.post(
+                    url,
+                    params=signed_params,
+                    data=body,
+                    headers=headers,
                 ),
                 method="POST",
                 url=url,
@@ -719,3 +798,150 @@ class BilibiliClient:
                 )
             )
         return progresses
+
+    async def get_mission_reward_info(self, task_id: str) -> MissionRewardInfo:
+        normalized_id = task_id.strip()
+        if not normalized_id:
+            raise ValueError("task_id 不能为空")
+
+        payload: dict[str, Any] = {}
+        for attempt, delay in enumerate((0.0, 1.5, 3.0), start=1):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            payload = await self._signed_get_json(
+                "https://api.bilibili.com/x/activity_components/mission/info",
+                {"task_id": normalized_id},
+                headers=self._mission_headers(normalized_id),
+                retry_on_wbi_miss=True,
+            )
+            if payload.get("code") == 0 or not self._is_rate_limited_payload(payload):
+                break
+            LOGGER.info(
+                "查询领奖信息触发限频 task_id=%s attempt=%s，稍后重试",
+                normalized_id,
+                attempt,
+            )
+        if payload.get("code") != 0:
+            raise ValueError(f"查询领奖信息失败: {payload.get('message')}")
+
+        data = payload.get("data") or {}
+        reward_info = data.get("reward_info") or {}
+        return MissionRewardInfo(
+            task_id=str(data.get("task_id") or normalized_id),
+            task_name=str(data.get("task_name") or normalized_id),
+            status=int(data.get("status") or 0),
+            message=str(data.get("message") or ""),
+            act_id=str(data.get("act_id") or ""),
+            act_name=str(data.get("act_name") or ""),
+            reward_name=str(reward_info.get("award_name") or ""),
+        )
+
+    async def receive_mission_reward(
+        self, info: MissionRewardInfo
+    ) -> MissionRewardClaimResult:
+        if info.is_claimed:
+            return MissionRewardClaimResult(
+                task_id=info.task_id,
+                task_name=info.task_name,
+                reward_name=info.reward_name,
+                status=info.status,
+                message=info.message or "已领取",
+                success=True,
+                skipped=True,
+            )
+        if not info.is_claimable:
+            return MissionRewardClaimResult(
+                task_id=info.task_id,
+                task_name=info.task_name,
+                reward_name=info.reward_name,
+                status=info.status,
+                message=info.message or "当前状态不可领取",
+                success=False,
+                skipped=True,
+            )
+
+        if not self.bili_jct:
+            raise ValueError("cookie 缺少 bili_jct，无法领取奖励")
+
+        body = {
+            "task_id": info.task_id,
+            "activity_id": info.act_id,
+            "activity_name": info.act_name,
+            "task_name": info.task_name,
+            "reward_name": info.reward_name,
+            "gaia_vtoken": "",
+            "receive_from": "missionPage",
+            "csrf": self.bili_jct,
+            "csrf_token": self.bili_jct,
+        }
+        payload: dict[str, Any] = {}
+        for attempt, delay in enumerate((0.0, 1.5, 3.0), start=1):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            payload = await self._signed_post_form_json(
+                "https://api.bilibili.com/x/activity_components/mission/receive",
+                {},
+                body,
+                headers={
+                    **self._mission_headers(info.task_id),
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                retry_on_wbi_miss=True,
+            )
+            if payload.get("code") == 0 or not self._is_rate_limited_payload(payload):
+                break
+            LOGGER.info(
+                "领取奖励触发限频 task_id=%s attempt=%s，稍后重试",
+                info.task_id,
+                attempt,
+            )
+        code = payload.get("code")
+        message = str(payload.get("message") or "")
+        if code == 0:
+            if not message or message == "0":
+                message = "领取成功"
+            return MissionRewardClaimResult(
+                task_id=info.task_id,
+                task_name=info.task_name,
+                reward_name=info.reward_name,
+                status=6,
+                message=message,
+                success=True,
+                skipped=False,
+                code=code,
+            )
+        return MissionRewardClaimResult(
+            task_id=info.task_id,
+            task_name=info.task_name,
+            reward_name=info.reward_name,
+            status=info.status,
+            message=message or "领取失败",
+            success=False,
+            skipped=False,
+            code=code,
+        )
+
+    async def receive_all_mission_rewards(
+        self, task_ids: list[str]
+    ) -> list[MissionRewardClaimResult]:
+        normalized_ids = [task_id.strip() for task_id in task_ids if task_id.strip()]
+        results: list[MissionRewardClaimResult] = []
+        for index, task_id in enumerate(normalized_ids):
+            try:
+                info = await self.get_mission_reward_info(task_id)
+                results.append(await self.receive_mission_reward(info))
+            except Exception as exc:
+                results.append(
+                    MissionRewardClaimResult(
+                        task_id=task_id,
+                        task_name=task_id,
+                        reward_name="",
+                        status=-1,
+                        message=str(exc),
+                        success=False,
+                        skipped=False,
+                    )
+                )
+            if index < len(normalized_ids) - 1:
+                await asyncio.sleep(1.2)
+        return results
