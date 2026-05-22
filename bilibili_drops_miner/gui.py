@@ -121,6 +121,8 @@ class MinerGUI(QMainWindow):
         self._task_refresh_inflight: bool = False
         self._task_refresh_queued: bool = False
         self._task_refresh_trigger_pending: bool = False
+        self._reward_claim_lock = threading.Lock()
+        self._reward_claim_inflight: bool = False
         self._stopping_in_progress: bool = False
         self._stop_poll_started_at: float | None = None
         self._stop_timeout_warned: bool = False
@@ -267,6 +269,8 @@ class MinerGUI(QMainWindow):
         task_title.setStyleSheet("color:#f5f6f8;")
         task_header.addWidget(task_title)
         task_header.addStretch(1)
+        self.claim_rewards_btn = self._make_button("领取奖励", "blue", self.claim_rewards)
+        task_header.addWidget(self.claim_rewards_btn)
         task_header.addWidget(self._make_button("手动刷新", "", self.refresh_tasks))
         task_layout.addLayout(task_header)
 
@@ -620,6 +624,48 @@ class MinerGUI(QMainWindow):
                 self._post_ui_task(self._complete_task_refresh, result_text, rerun)
 
         threading.Thread(target=_do, daemon=True, name="gui-task-refresh").start()
+
+    def claim_rewards(self, *args, **kwargs) -> None:
+        # QPushButton.clicked may pass a bool (checked) — ignore positional args.
+        cookie = self.cookie_edit.text().strip()
+        if not cookie:
+            self._show_warning("提示", "请先填写 Cookie")
+            return
+        task_ids = parse_task_ids(self.task_ids_edit.text().strip())
+        if not task_ids:
+            self._show_warning("提示", "请先填写或自动获取任务 ID")
+            return
+
+        with self._reward_claim_lock:
+            if self._reward_claim_inflight:
+                self._set_task_progress_text("已有领奖任务进行中，请稍候...")
+                return
+            self._reward_claim_inflight = True
+
+        self._set_task_progress_text("正在领取全部可领取奖励...")
+
+        def _do() -> None:
+            result_text = ""
+            try:
+
+                async def _claim():
+                    client = BilibiliClient(cookie)
+                    try:
+                        return await client.receive_all_mission_rewards(task_ids)
+                    finally:
+                        await client.close()
+
+                results = asyncio.run(_claim())
+                result_text = self._format_reward_claim_results(results)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("领取奖励失败: %s", exc)
+                result_text = f"领取奖励失败: {exc}"
+            finally:
+                with self._reward_claim_lock:
+                    self._reward_claim_inflight = False
+                self._post_ui_task(self._set_task_progress_text, result_text)
+
+        threading.Thread(target=_do, daemon=True, name="gui-reward-claim").start()
 
     @staticmethod
     def _find_browser(name: str) -> bool:
@@ -1313,6 +1359,55 @@ class MinerGUI(QMainWindow):
                 lines.append(f"{task.task_name} ({cur}/{target})")
                 lines.append(f"  {bar}{status}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_reward_claim_results(results: list) -> str:
+        if not results:
+            return "无可领取任务数据"
+
+        success_count = sum(1 for item in results if item.success and not item.skipped)
+        claimed_count = sum(1 for item in results if item.success and item.skipped)
+        skipped_count = sum(1 for item in results if item.skipped and not item.success)
+        failed_count = sum(1 for item in results if not item.success and not item.skipped)
+
+        lines = [
+            "领取结果",
+            (
+                f"领取成功 {success_count} 个，已领取 {claimed_count} 个，"
+                f"跳过 {skipped_count} 个，失败 {failed_count} 个"
+            ),
+            "",
+        ]
+        for item in results:
+            if item.success and item.skipped:
+                prefix = "已领取"
+            elif item.success:
+                prefix = "领取成功"
+            elif item.skipped:
+                prefix = "跳过"
+            else:
+                prefix = "失败"
+
+            name = item.task_name or item.task_id
+            reward = f" - {item.reward_name}" if item.reward_name else ""
+            if item.success:
+                lines.append(f"[{prefix}] {name}{reward}")
+                continue
+
+            message = MinerGUI._clean_reward_message(item.message, item.skipped)
+            if item.code is not None and item.code != 0:
+                message = f"{message} (code={item.code})"
+            lines.append(f"[{prefix}] {name}{reward}: {message}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _clean_reward_message(message: str, skipped: bool) -> str:
+        cleaned = str(message or "").strip()
+        if cleaned in {"", "0", "查看奖励"}:
+            if skipped:
+                return "当前不可领取"
+            return "领取失败"
+        return cleaned
 
     def _sync_config_to_miner(self) -> None:
         if self.miner is None:
