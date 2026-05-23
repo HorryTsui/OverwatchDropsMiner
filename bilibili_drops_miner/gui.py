@@ -10,14 +10,17 @@ import re
 import sys
 import threading
 import time
+import urllib.request
+import webbrowser
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QFont, QTextCursor
+from PySide6.QtGui import QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QFileDialog,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QInputDialog,
@@ -28,6 +31,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -41,6 +45,25 @@ from bilibili_drops_miner.utils import (
     parse_room_ids,
     parse_task_ids,
 )
+
+try:
+    from bilibili_drops_miner._version import (
+        APP_VERSION,
+        LATEST_RELEASE_API,
+        RELEASES_URL,
+        UPDATE_CHANNEL,
+    )
+except Exception:
+    APP_VERSION = "0.0.0+dev"
+    UPDATE_CHANNEL = "dev"
+    LATEST_RELEASE_API = (
+        "https://api.github.com/repos/mi0e/BiliBiliDropsMiner/releases/latest"
+    )
+    RELEASES_URL = "https://github.com/mi0e/BiliBiliDropsMiner/releases/latest"
+
+
+def _normalize_version(value: str) -> str:
+    return value.strip().lower().lstrip("v")
 
 
 class QueueLogHandler(logging.Handler):
@@ -107,11 +130,11 @@ class MinerGUI(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Bilibili 直播掉宝助手")
-        self.resize(1000, 720)
-        self.setMinimumSize(1000, 720)
-        self._size_expanded = (1000, 920)
-        self._size_collapsed = (1000, 720)
+        self.setWindowTitle(f"Bilibili 直播掉宝助手 {APP_VERSION}")
+        self.resize(1040, 760)
+        self.setMinimumSize(860, 620)
+        self._size_expanded = (1040, 920)
+        self._size_collapsed = (1040, 760)
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.worker_thread: threading.Thread | None = None
@@ -155,6 +178,8 @@ class MinerGUI(QMainWindow):
         self._task_refresh_timer = QTimer(self)
         self._task_refresh_timer.setSingleShot(True)
         self._task_refresh_timer.timeout.connect(self._schedule_task_refresh)
+
+        QTimer.singleShot(3000, self._check_update_silent)
 
     # ---------- layout ----------
 
@@ -249,7 +274,8 @@ class MinerGUI(QMainWindow):
         # indeterminate progress bar (Qt handles animation natively)
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False)
-        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setMinimumHeight(6)
+        self.progress_bar.setMaximumHeight(10)
         self.progress_bar.setRange(0, 1)  # stopped state
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
@@ -283,11 +309,12 @@ class MinerGUI(QMainWindow):
         self.task_text.setReadOnly(True)
         self.task_text.setFont(QFont("Consolas", 10))
         self.task_text.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.task_text.setFixedHeight(180)
+        self.task_text.setMinimumHeight(160)
+        self.task_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.task_text.setPlainText("点击“手动刷新”查看任务进度")
         task_layout.addWidget(self.task_text)
 
-        root_layout.addWidget(task_card)
+        root_layout.addWidget(task_card, 1)
 
         # ---- Log card (collapsible, default collapsed) ----
         self.log_card = QFrame()
@@ -315,11 +342,12 @@ class MinerGUI(QMainWindow):
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QFont("Consolas", 10))
         self.log_text.setMaximumBlockCount(5000)
+        self.log_text.setMinimumHeight(160)
+        self.log_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.log_text.setVisible(False)
         log_layout.addWidget(self.log_text)
 
         root_layout.addWidget(self.log_card)
-        root_layout.addStretch(1)
 
         self._log_expanded = False
 
@@ -331,13 +359,16 @@ class MinerGUI(QMainWindow):
     def _make_small_edit(self, default: str) -> QLineEdit:
         w = QLineEdit()
         w.setText(default)
-        w.setFixedWidth(70)
+        w.setMinimumWidth(70)
+        w.setMaximumWidth(120)
+        w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         return w
 
     def _make_button(self, text: str, color: str, slot) -> QPushButton:
         btn = QPushButton(text)
         btn.setStyleSheet(_BUTTON_STYLES.get(color, _BUTTON_STYLES[""]))
         btn.setCursor(Qt.PointingHandCursor)
+        btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         btn.clicked.connect(slot)
         return btn
 
@@ -350,14 +381,16 @@ class MinerGUI(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(8)
         lab = QLabel(label)
-        lab.setFixedWidth(72)
+        lab.setMinimumWidth(72)
+        lab.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         lab.setStyleSheet("color:#9aa0a6;")
         row.addWidget(lab)
+        editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         row.addWidget(editor, 1)
         if extra_button is not None:
             text, color, slot = extra_button
             b = self._make_button(text, color, slot)
-            b.setFixedWidth(100)
+            b.setMinimumWidth(100)
             row.addWidget(b)
         return row
 
@@ -398,10 +431,10 @@ class MinerGUI(QMainWindow):
             except queue.Empty:
                 break
         if lines:
+            scroll_bar = self.log_text.verticalScrollBar()
+            scroll_value = scroll_bar.value()
             self.log_text.appendPlainText("\n".join(lines))
-            cursor = self.log_text.textCursor()
-            cursor.movePosition(QTextCursor.End)
-            self.log_text.setTextCursor(cursor)
+            scroll_bar.setValue(min(scroll_value, scroll_bar.maximum()))
 
         if self._task_progress_pending:
             self._task_progress_pending = False
@@ -421,6 +454,95 @@ class MinerGUI(QMainWindow):
 
     def _show_error(self, title: str, msg: str) -> None:
         QMessageBox.critical(self, title, msg)
+
+    # ---------- update check ----------
+
+    def _check_update_silent(self) -> None:
+        if UPDATE_CHANNEL != "release":
+            return
+        current_version = _normalize_version(APP_VERSION)
+        if not current_version or current_version.startswith("dev"):
+            return
+
+        def _do() -> None:
+            try:
+                request = urllib.request.Request(
+                    LATEST_RELEASE_API,
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "User-Agent": "BilibiliDropsMiner",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=8) as response:
+                    if response.status >= 400:
+                        return
+                    payload = json.loads(
+                        response.read(65536).decode("utf-8", errors="replace")
+                    )
+                latest_version = str(payload.get("tag_name") or "").strip()
+                if not latest_version:
+                    return
+                if _normalize_version(latest_version) == current_version:
+                    return
+                release_url = str(payload.get("html_url") or "").strip() or RELEASES_URL
+                self._post_ui_task(
+                    self._show_update_available,
+                    latest_version,
+                    release_url,
+                )
+            except Exception:
+                return
+
+        threading.Thread(target=_do, daemon=True, name="gui-update-check").start()
+
+    def _show_update_available(self, latest_version: str, release_url: str) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("发现新版本")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(430)
+        dialog.setStyleSheet(
+            "QDialog{background:#1f232b;color:#e6e7eb;}"
+            "QLabel{color:#e6e7eb;}"
+            "QPushButton{background:#2f343e;color:#e6e7eb;border:1px solid #3a3f4b;"
+            "border-radius:6px;padding:8px 18px;min-width:92px;}"
+            "QPushButton:hover{background:#3a4150;border-color:#4f8cff;}"
+            "QPushButton#primary{background:#4f8cff;color:#ffffff;border-color:#4f8cff;}"
+            "QPushButton#primary:hover{background:#3b73e6;}"
+        )
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(14)
+
+        title = QLabel(f"发现新版本 {latest_version}")
+        title_font = QFont()
+        title_font.setPointSize(14)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        layout.addWidget(title)
+
+        body = QLabel(
+            f"当前版本：{APP_VERSION}\n"
+            "发布仓库：github.com/mi0e/BiliBiliDropsMiner\n"
+            "可前往发布页下载最新版本。"
+        )
+        body.setWordWrap(True)
+        body.setStyleSheet("color:#c9d1d9;line-height:1.45;")
+        layout.addWidget(body)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        later_btn = QPushButton("稍后")
+        open_btn = QPushButton("打开发布页")
+        open_btn.setObjectName("primary")
+        later_btn.clicked.connect(dialog.reject)
+        open_btn.clicked.connect(dialog.accept)
+        button_row.addWidget(later_btn)
+        button_row.addWidget(open_btn)
+        layout.addLayout(button_row)
+
+        if dialog.exec() == QDialog.Accepted:
+            webbrowser.open(release_url)
 
     # ---------- config ----------
 
@@ -560,11 +682,11 @@ class MinerGUI(QMainWindow):
         if self._log_expanded:
             self.log_text.setVisible(False)
             self._log_toggle_btn.setText("▶ 运行日志")
-            self.resize(*self._size_collapsed)
+            self.resize(self.width(), self._size_collapsed[1])
         else:
             self.log_text.setVisible(True)
             self._log_toggle_btn.setText("▼ 运行日志")
-            self.resize(*self._size_expanded)
+            self.resize(self.width(), self._size_expanded[1])
         self._log_expanded = not self._log_expanded
 
     def clear_logs(self) -> None:
@@ -668,6 +790,8 @@ class MinerGUI(QMainWindow):
             finally:
                 with self._reward_claim_lock:
                     self._reward_claim_inflight = False
+                if result_text:
+                    logging.getLogger(__name__).info("领取奖励结果:\n%s", result_text)
                 self._post_ui_task(self._set_task_progress_text, result_text)
 
         threading.Thread(target=_do, daemon=True, name="gui-reward-claim").start()
@@ -966,9 +1090,11 @@ class MinerGUI(QMainWindow):
         on_page_url=None,
         on_page_html=None,
         browser_preference: str | None = None,
+        finish_on_any: bool = False,
     ) -> None:
         def _do() -> None:
             server = None
+            server_thread = None
             ext_dir = None
             driver = None
             browser_type = None
@@ -986,9 +1112,11 @@ class MinerGUI(QMainWindow):
                 need_cookie = on_cookies is not None
                 need_url = on_page_url is not None
                 need_html = on_page_html is not None
+                need_page = need_url or need_html
 
                 net_captured: list = []
                 cookie_captured: list = []
+                page_captured: list = []
 
                 class _Handler(BaseHTTPRequestHandler):
                     def do_POST(self):
@@ -998,6 +1126,8 @@ class MinerGUI(QMainWindow):
                             data = json.loads(body)
                             if data.get("type") == "__bili_cookies__":
                                 cookie_captured.append(data["cookies"])
+                            elif data.get("type") == "__bili_page__":
+                                page_captured.append(data)
                             else:
                                 net_captured.append(data)
                         except Exception:
@@ -1018,9 +1148,43 @@ class MinerGUI(QMainWindow):
 
                 server = HTTPServer(("127.0.0.1", 0), _Handler)
                 port = server.server_address[1]
-                threading.Thread(target=server.serve_forever, daemon=True).start()
+                server_thread = threading.Thread(
+                    target=server.serve_forever,
+                    daemon=True,
+                    name="bili-sniff-server",
+                )
+                server_thread.start()
 
                 ext_dir = tempfile.mkdtemp(prefix="bili_sniff_")
+
+                def _page_reporter_js(port_local: int) -> str:
+                    return (
+                        "(function(){\n"
+                        "if(window.__bili_page_reporter__)return;\n"
+                        "window.__bili_page_reporter__=true;\n"
+                        "var last='';\n"
+                        "function sendPage(){\n"
+                        "  if(document.visibilityState!=='visible')return;\n"
+                        "  var url=window.location.href;\n"
+                        "  if(url.indexOf('live.bilibili.com')===-1)return;\n"
+                        "  var html=document.documentElement?document.documentElement.outerHTML:'';\n"
+                        "  var key=url+'|'+html.length;\n"
+                        "  if(key===last)return;\n"
+                        "  last=key;\n"
+                        "  fetch('http://127.0.0.1:"
+                        + str(port_local)
+                        + "/',{\n"
+                        "    method:'POST',\n"
+                        "    headers:{'Content-Type':'application/json'},\n"
+                        "    body:JSON.stringify({type:'__bili_page__',url:url,html:html})\n"
+                        "  }).catch(function(){});\n"
+                        "}\n"
+                        "sendPage();\n"
+                        "setInterval(sendPage,1000);\n"
+                        "document.addEventListener('visibilitychange',sendPage);\n"
+                        "window.addEventListener('load',sendPage);\n"
+                        "})();"
+                    )
 
                 def _write_ext_edge() -> None:
                     manifest: dict = {
@@ -1052,7 +1216,7 @@ class MinerGUI(QMainWindow):
                             "window.fetch=async function(){\n"
                             "  var resp=await origFetch.apply(this,arguments);\n"
                             "  var url=(typeof arguments[0]==='string')?arguments[0]:arguments[0].url;\n"
-                            "  if(url.indexOf('" + (url_keyword or "") + "')!==-1){\n"
+                            "  if(document.visibilityState==='visible'&&url.indexOf('" + (url_keyword or "") + "')!==-1){\n"
                             "    try{var d=await resp.clone().json();\n"
                             "      window.postMessage({type:'__bili_sniff__',payload:{url:url,data:d,page_url:window.location.href}},'*');\n"
                             "    }catch(e){}\n"
@@ -1066,7 +1230,7 @@ class MinerGUI(QMainWindow):
                             "XMLHttpRequest.prototype.send=function(){\n"
                             "  var self=this;\n"
                             "  this.addEventListener('load',function(){\n"
-                            "    if(self.__url&&self.__url.indexOf('"
+                            "    if(document.visibilityState==='visible'&&self.__url&&self.__url.indexOf('"
                             + (url_keyword or "")
                             + "')!==-1){\n"
                             "      try{window.postMessage({type:'__bili_sniff__',\n"
@@ -1089,6 +1253,16 @@ class MinerGUI(QMainWindow):
                             "  }\n"
                             "});"
                         )
+
+                    if need_page:
+                        manifest["content_scripts"].append(
+                            {
+                                "matches": ["*://*.bilibili.com/*"],
+                                "js": ["page.js"],
+                                "run_at": "document_idle",
+                            }
+                        )
+                        files["page.js"] = _page_reporter_js(port)
 
                     if need_cookie:
                         manifest["permissions"] = ["cookies"]
@@ -1134,10 +1308,14 @@ class MinerGUI(QMainWindow):
                     )
 
                     background_js = (
+                        "var NEED_NET = " + ("true" if need_net else "false") + ";\n"
+                        "var NEED_COOKIE = "
+                        + ("true" if need_cookie else "false")
+                        + ";\n"
                         "var injectedTabs = {};\n"
                         "var PORT = " + str(port_local) + ";\n"
                         "function injectTab(tabId) {\n"
-                        "  if (injectedTabs[tabId]) return;\n"
+                        "  if (!NEED_NET || injectedTabs[tabId]) return;\n"
                         "  injectedTabs[tabId] = true;\n"
                         "  chrome.scripting.executeScript({\n"
                         "    target: {tabId: tabId},\n"
@@ -1165,7 +1343,7 @@ class MinerGUI(QMainWindow):
                         "      window.fetch = async function() {\n"
                         "        var resp = await origFetch.apply(this, arguments);\n"
                         "        var url = (typeof arguments[0] === 'string') ? arguments[0] : arguments[0].url;\n"
-                        "        if (url.indexOf(kw) !== -1) {\n"
+                        "        if (document.visibilityState === 'visible' && url.indexOf(kw) !== -1) {\n"
                         "          try {\n"
                         "            var d = await resp.clone().json();\n"
                         "            window.postMessage({type: '__bili_sniff__', payload: {url: url, data: d, page_url: window.location.href}}, '*');\n"
@@ -1181,7 +1359,7 @@ class MinerGUI(QMainWindow):
                         "      XMLHttpRequest.prototype.send = function() {\n"
                         "        var self = this;\n"
                         "        this.addEventListener('load', function() {\n"
-                        "          if (self.__url && self.__url.indexOf(kw) !== -1) {\n"
+                        "          if (document.visibilityState === 'visible' && self.__url && self.__url.indexOf(kw) !== -1) {\n"
                         "            try {\n"
                         "              window.postMessage({type: '__bili_sniff__', payload: {url: self.__url, data: JSON.parse(self.responseText), page_url: window.location.href}}, '*');\n"
                         "            } catch(e) {}\n"
@@ -1192,6 +1370,7 @@ class MinerGUI(QMainWindow):
                         "    }\n"
                         "  });\n"
                         "}\n"
+                        "if (NEED_NET) {\n"
                         "chrome.tabs.onUpdated.addListener(function(tabId, changeInfo, tab) {\n"
                         "  if (changeInfo.status === 'complete' && tab.url && tab.url.indexOf('bilibili.com') !== -1) {\n"
                         "    injectTab(tabId);\n"
@@ -1200,7 +1379,9 @@ class MinerGUI(QMainWindow):
                         "chrome.tabs.query({url: '*://*.bilibili.com/*'}, function(tabs) {\n"
                         "  tabs.forEach(function(tab) { injectTab(tab.id); });\n"
                         "});\n"
+                        "}\n"
                         "function sendCookies() {\n"
+                        "  if (!NEED_COOKIE) return;\n"
                         "  chrome.cookies.getAll({domain: '.bilibili.com'}, function(cookies) {\n"
                         "    if (cookies && cookies.length > 0) {\n"
                         "      fetch('http://127.0.0.1:' + PORT + '/', {\n"
@@ -1211,6 +1392,7 @@ class MinerGUI(QMainWindow):
                         "    }\n"
                         "  });\n"
                         "}\n"
+                        "if (NEED_COOKIE) {\n"
                         "sendCookies();\n"
                         "setInterval(sendCookies, 3000);\n"
                         "chrome.cookies.onChanged.addListener(function(changeInfo) {\n"
@@ -1218,6 +1400,7 @@ class MinerGUI(QMainWindow):
                         "    sendCookies();\n"
                         "  }\n"
                         "});\n"
+                        "}\n"
                     )
 
                     manifest = {
@@ -1242,6 +1425,15 @@ class MinerGUI(QMainWindow):
                             }
                         )
 
+                    if need_page:
+                        manifest["content_scripts"].append(
+                            {
+                                "matches": ["*://*.bilibili.com/*"],
+                                "js": ["page.js"],
+                                "run_at": "document_idle",
+                            }
+                        )
+
                     ext_path = os.path.join(ext_dir, "manifest.json")
                     with open(ext_path, "w", encoding="utf-8") as f:
                         json.dump(manifest, f, indent=2)
@@ -1256,6 +1448,12 @@ class MinerGUI(QMainWindow):
                             os.path.join(ext_dir, "relay.js"), "w", encoding="utf-8"
                         ) as f:
                             f.write(relay_js)
+
+                    if need_page:
+                        with open(
+                            os.path.join(ext_dir, "page.js"), "w", encoding="utf-8"
+                        ) as f:
+                            f.write(_page_reporter_js(port_local))
 
                 last_exc = None
                 for _browser in MinerGUI._browser_try_order(browser_preference):
@@ -1307,6 +1505,7 @@ class MinerGUI(QMainWindow):
                 net_done = False
                 url_done = False
                 html_done = False
+                html_attempts = 0
                 last_cookie_count = 0
                 for i in range(120):
                     if need_cookie and not cookie_done and cookie_captured:
@@ -1339,41 +1538,67 @@ class MinerGUI(QMainWindow):
                             if len(cookie_captured) > last_cookie_count:
                                 last_cookie_count = len(cookie_captured)
 
-                    if need_net and not net_done and net_captured:
-                        on_network_match(net_captured[0])
-                        net_done = True
+                    if (need_url and not url_done) or (need_html and not html_done):
+                        html_attempted = False
+                        latest_page = None
+                        while page_captured:
+                            latest_page = page_captured.pop(0)
+                        if latest_page:
+                            cur_url = str(latest_page.get("url") or "")
+                            room_id = MinerGUI._extract_room_id_from_live_url(cur_url)
 
-                    if need_url and not url_done:
+                            if room_id is not None and need_url and not url_done:
+                                try:
+                                    on_page_url(room_id)
+                                    url_done = True
+                                except Exception:
+                                    logging.getLogger(__name__).exception(
+                                        "on_page_url 回调失败"
+                                    )
+
+                            if room_id is not None and need_html and not html_done:
+                                try:
+                                    page_html = str(latest_page.get("html") or "")
+                                    html_attempted = True
+                                    html_done = bool(on_page_html(page_html, cur_url))
+                                except Exception:
+                                    logging.getLogger(__name__).exception(
+                                        "页面源码回调失败"
+                                    )
+                        if html_attempted and not html_done:
+                            html_attempts += 1
+
+                    network_ready = (
+                        not need_html
+                        or not finish_on_any
+                        or html_done
+                        or html_attempts >= 3
+                    )
+                    if need_net and not net_done and net_captured and network_ready:
+                        payload = net_captured.pop(0) if finish_on_any else net_captured[0]
                         try:
-                            cur_url = driver.current_url or ""
+                            on_network_match(payload)
+                            net_done = True
                         except Exception:
-                            cur_url = ""
-                        room_id = MinerGUI._extract_room_id_from_live_url(cur_url)
-                        if room_id is not None:
-                            try:
-                                on_page_url(room_id)
-                            except Exception:
-                                logging.getLogger(__name__).exception("on_page_url 回调失败")
-                            url_done = True
+                            if finish_on_any:
+                                logging.getLogger(__name__).exception(
+                                    "网络响应回调失败，继续等待其他获取方式"
+                                )
+                            else:
+                                raise
 
-                    if need_html and not html_done:
-                        try:
-                            cur_url = driver.current_url or ""
-                        except Exception:
-                            cur_url = ""
-                        room_id = MinerGUI._extract_room_id_from_live_url(cur_url)
-                        if room_id is not None:
-                            try:
-                                page_html = driver.page_source or ""
-                                html_done = bool(on_page_html(page_html, cur_url))
-                            except Exception:
-                                logging.getLogger(__name__).exception("页面源码回调失败")
-
-                    if (
-                        (not need_cookie or cookie_done)
-                        and (not need_net or net_done)
-                        and (not need_url or url_done)
-                        and (not need_html or html_done)
+                    done_states = [
+                        done
+                        for enabled, done in (
+                            (need_cookie, cookie_done),
+                            (need_net, net_done),
+                            (need_url, url_done),
+                            (need_html, html_done),
+                        )
+                        if enabled
+                    ]
+                    if done_states and (
+                        any(done_states) if finish_on_any else all(done_states)
                     ):
                         break
 
@@ -1389,6 +1614,20 @@ class MinerGUI(QMainWindow):
                 logging.getLogger(__name__).exception("自动获取失败")
                 self._post_ui_task(self._show_error, "错误", f"自动获取失败: {exc}")
             finally:
+                if server:
+                    try:
+                        server.shutdown()
+                    except Exception:
+                        pass
+                    try:
+                        server.server_close()
+                    except Exception:
+                        pass
+                if server_thread and server_thread.is_alive():
+                    try:
+                        server_thread.join(timeout=2)
+                    except Exception:
+                        pass
                 if cdp_session:
                     try:
                         cdp_session.close()
@@ -1397,11 +1636,6 @@ class MinerGUI(QMainWindow):
                 if driver:
                     try:
                         driver.quit()
-                    except Exception:
-                        pass
-                if server:
-                    try:
-                        server.shutdown()
                     except Exception:
                         pass
                 if ext_dir:
@@ -1465,11 +1699,39 @@ class MinerGUI(QMainWindow):
             self._post_ui_task(self._apply_selected_task_group, room_id, task_groups)
             return True
 
+        def on_match(payload) -> None:
+            payload_data = payload if isinstance(payload, dict) else {}
+            request_url = str(payload_data.get("url") or "")
+            page_url = str(payload_data.get("page_url") or "")
+            room_id = self._extract_room_id_from_live_url(page_url)
+            if room_id is None:
+                room_id = self._extract_room_id_from_live_url(request_url)
+            if room_id is not None:
+                self._post_ui_task(self._apply_auto_room_id, room_id)
+                logging.getLogger(__name__).info("房间号获取成功: %s", room_id)
+
+            data = payload_data.get("data")
+            if not isinstance(data, dict):
+                raise ValueError("task response payload invalid")
+            if data.get("code") != 0:
+                raise ValueError("response code != 0")
+            tasks = data.get("data", {}).get("list", [])
+            task_ids = [t.get("task_id") for t in tasks if t.get("task_id")]
+            if not task_ids:
+                raise ValueError("empty task list")
+            self._post_ui_task(self._apply_auto_task_ids, ",".join(task_ids))
+            logging.getLogger(__name__).info(
+                "任务ID获取成功（API 兜底）: %s",
+                ",".join(task_ids),
+            )
+
         self._browser_sniff(
-            None,
+            "/x/task/totalv2",
             "已打开浏览器，请打开有当前任务的直播间并等待页面加载完成",
+            on_network_match=on_match,
             on_page_html=on_page_html,
             browser_preference=browser,
+            finish_on_any=True,
         )
         return
 
