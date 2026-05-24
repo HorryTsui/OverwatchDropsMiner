@@ -612,6 +612,18 @@ class BilibiliClient:
             live_status=live_status,
         )
 
+    async def get_live_room_html(self, room_id: int) -> str:
+        response = await self._request_with_transient_retry(
+            lambda: self._http.get(
+                f"https://live.bilibili.com/{room_id}",
+                headers=self._live_headers(room_id)
+            ),
+            method="GET",
+            url=f"https://live.bilibili.com/{room_id}",
+        )
+        response.raise_for_status()
+        return response.text
+
     async def room_entry_action(self, room_id: int) -> None:
         if not self.bili_jct:
             raise ValueError("cookie 缺少 bili_jct，无法上报 roomEntryAction")

@@ -39,6 +39,11 @@ def build(
         name,
     ]
 
+    import os
+    icon_path = os.path.join("img", "app.ico")
+    if os.path.exists(icon_path):
+        cmd.extend(["--icon", icon_path])
+
     cmd.append("--onefile" if onefile else "--onedir")
 
     if clean:

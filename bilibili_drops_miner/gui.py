@@ -553,6 +553,7 @@ class MinerGUI(QMainWindow):
             thread_count=int(self.threads_edit.text().strip() or "1"),
             reconnect_delay_seconds=int(self.reconnect_edit.text().strip() or "8"),
             enable_web_heartbeat=True,
+            auto_discover_tasks=True,
             task_ids=parse_task_ids(self.task_ids_edit.text().strip()),
             task_query_interval_seconds=int(
                 self.task_interval_edit.text().strip() or "30"
@@ -1037,14 +1038,24 @@ class MinerGUI(QMainWindow):
             self._show_warning("提示", "未从当前直播页解析到掉宝任务分组")
             return
 
-        options = [
-            f"{str(group.get('label') or '任务组')} ({len(group.get('task_ids') or [])} 个任务)"
+        options = []
+        all_task_ids = []
+        for group in task_groups:
+            for tid in (group.get("task_ids") or []):
+                if tid not in all_task_ids:
+                    all_task_ids.append(tid)
+        
+        if all_task_ids:
+            options.append(f"全部任务 (包含所有天, 共 {len(all_task_ids)} 个)")
+            
+        options.extend(
+            f"{str(group.get('label') or '任务组')} ({len(group.get('task_ids') or [])} 个)"
             for group in task_groups
-        ]
+        )
         default_index = 0
         for index, group in enumerate(task_groups):
             if bool(group.get("active")):
-                default_index = index
+                default_index = (index + 1) if all_task_ids else index
                 break
 
         selected_option, ok = QInputDialog.getItem(
@@ -1064,12 +1075,19 @@ class MinerGUI(QMainWindow):
         except ValueError:
             selected_index = default_index
 
-        selected_group = task_groups[selected_index]
-        task_ids = [
-            str(task_id).strip()
-            for task_id in (selected_group.get("task_ids") or [])
-            if str(task_id).strip()
-        ]
+        if all_task_ids and selected_index == 0:
+            task_ids = [str(tid).strip() for tid in all_task_ids if str(tid).strip()]
+            group_label = "全部任务"
+        else:
+            actual_group_index = selected_index - 1 if all_task_ids else selected_index
+            selected_group = task_groups[actual_group_index]
+            task_ids = [
+                str(task_id).strip()
+                for task_id in (selected_group.get("task_ids") or [])
+                if str(task_id).strip()
+            ]
+            group_label = selected_group.get("label") or f"任务组 {actual_group_index + 1}"
+
         if not task_ids:
             self._show_warning("提示", "所选分组中没有可用的任务 ID")
             return
@@ -1077,7 +1095,7 @@ class MinerGUI(QMainWindow):
         self._apply_auto_task_ids(",".join(task_ids))
         logging.getLogger(__name__).info(
             "任务ID获取成功: %s -> %s",
-            selected_group.get("label") or f"任务组 {selected_index + 1}",
+            group_label,
             ",".join(task_ids),
         )
 

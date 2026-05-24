@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from bilibili_drops_miner.client import BilibiliClient
 from bilibili_drops_miner.config import MinerConfig
 from bilibili_drops_miner.notifier import MultiPlatformNotifier
+from bilibili_drops_miner.utils import extract_bili_live_task_groups
 from bilibili_drops_miner.x25kn_worker import X25KnWorker
 
 LOGGER = logging.getLogger(__name__)
@@ -128,6 +129,36 @@ class BilibiliWatchTimeMiner:
         uid, uname = asyncio.run(self._probe_login())
         self._uid = uid
         self._uname = uname
+
+        if self.config.auto_discover_tasks and self.config.room_ids:
+            try:
+                LOGGER.info("正在自动获取多日任务ID...")
+                async def _discover():
+                    client = BilibiliClient(self.config.cookie)
+                    try:
+                        html = await client.get_live_room_html(self.config.room_ids[0])
+                        groups = extract_bili_live_task_groups(html)
+                        all_ids = []
+                        for g in groups:
+                            for tid in g.get("task_ids", []):
+                                if tid not in all_ids:
+                                    all_ids.append(tid)
+                        return all_ids
+                    finally:
+                        await client.close()
+                discovered_ids = asyncio.run(_discover())
+                if discovered_ids:
+                    added_count = 0
+                    for tid in discovered_ids:
+                        if tid not in self.config.task_ids:
+                            self.config.task_ids.append(tid)
+                            added_count += 1
+                    LOGGER.info("自动获取成功，页面包含 %d 个任务，新增追踪 %d 个任务", len(discovered_ids), added_count)
+                else:
+                    LOGGER.info("未从页面自动获取到任务ID")
+            except Exception as e:
+                LOGGER.error("自动获取任务ID失败: %s", e)
+
         if uid:
             LOGGER.info("登录成功: %s (UID: %s)", uname, uid)
         else:
