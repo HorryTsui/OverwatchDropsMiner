@@ -12,8 +12,9 @@
 
 - 多房间并发挂机，支持每房间多会话连接
 - 任务进度自动轮询 + 手动刷新
+- 支持多日任务自动获取与合并追踪（可自动监控跨天多日任务并合并展示进度，到时间自动跨天领奖）
 - 支持 Apprise 多平台通知（企业微信、Gotify、Server 酱等）
-- GUI 支持配置保存/加载、日志查看、自动获取 Cookie 与任务 ID
+- GUI 支持配置保存/加载、日志查看、自动获取 Cookie 与任务 ID（提供“全部任务”选项，一键全选追踪所有天任务）
 
 ## ⚠️ 免责声明
 
@@ -151,12 +152,16 @@ python bilibili.py \
 
 ## 📦 打包 EXE
 
+打包命令：
 ```bash
 python build.py               # 开发模式
-python build.py --target gui  # PyInstaller 打包 GUI
+python build.py --target gui  # PyInstaller 打包 GUI (默认嵌入 img/app.ico 图标)
 python build.py --target cli  # PyInstaller 打包 CLI
 python build_nuitka.py --target gui  # Nuitka 轻量打包 GUI
 ```
+
+> [!TIP]
+> 打包出的可执行文件默认会生成在 `dist/` 文件夹下。如需打包为**单文件 EXE 版**（只有一个独立的 `.exe` 方便直接运行与传播），请在运行前将 [build.py](build.py) 中的 `onefile=False` 修改为 `onefile=True`。
 
 ## 🧩 配置文件
 
