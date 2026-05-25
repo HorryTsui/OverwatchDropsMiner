@@ -31,6 +31,7 @@ class BilibiliWatchTimeMiner:
         self._clients: list[BilibiliClient] = []
         self._clients_lock = threading.Lock()
         self._force_stop_requested = False
+        self.on_tasks_discovered = None  # callback: (list[str]) -> None
 
     def _build_session_plans(self) -> list[SessionPlan]:
         plans: list[SessionPlan] = []
@@ -154,6 +155,11 @@ class BilibiliWatchTimeMiner:
                             self.config.task_ids.append(tid)
                             added_count += 1
                     LOGGER.info("自动获取成功，页面包含 %d 个任务，新增追踪 %d 个任务", len(discovered_ids), added_count)
+                    if added_count > 0 and self.on_tasks_discovered is not None:
+                        try:
+                            self.on_tasks_discovered(list(self.config.task_ids))
+                        except Exception:
+                            LOGGER.debug("on_tasks_discovered 回调失败", exc_info=True)
                 else:
                     LOGGER.info("未从页面自动获取到任务ID")
             except Exception as e:

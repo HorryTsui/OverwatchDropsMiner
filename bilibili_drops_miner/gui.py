@@ -578,6 +578,7 @@ class MinerGUI(QMainWindow):
             config = self._build_config()
             config.validate()
             self.miner = BilibiliWatchTimeMiner(config)
+            self.miner.on_tasks_discovered = self._on_tasks_discovered
         except Exception as exc:
             self._show_error("配置错误", str(exc))
             return
@@ -1025,6 +1026,10 @@ class MinerGUI(QMainWindow):
 
     def _apply_auto_task_ids(self, task_ids_str: str) -> None:
         self.task_ids_edit.setText(task_ids_str)
+
+    def _on_tasks_discovered(self, task_ids: list[str]) -> None:
+        """Called from worker thread when miner auto-discovers task IDs."""
+        self._post_ui_task(self._apply_auto_task_ids, ",".join(task_ids))
 
     def _apply_selected_task_group(
         self,
